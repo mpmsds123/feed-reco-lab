@@ -39,6 +39,17 @@ def welch_ttest(control: np.ndarray, treatment: np.ndarray, alpha=0.05) -> dict:
             "ci95": (diff - z * se, diff + z * se), "se": se}
 
 
+def paired_ttest(a: np.ndarray, b: np.ndarray, alpha=0.05) -> dict:
+    """Paired t-test on per-user differences (b - a): same users scored by two systems."""
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    d = b - a
+    se = d.std(ddof=1) / np.sqrt(d.size)
+    tstat, p = stats.ttest_rel(b, a)
+    z = stats.norm.ppf(1 - alpha / 2)
+    return {"mean_diff": d.mean(), "t_stat": float(tstat), "p_value": float(p),
+            "ci95": (d.mean() - z * se, d.mean() + z * se), "n": d.size}
+
+
 def cuped(y_control, y_treatment, x_control, x_treatment) -> dict:
     """CUPED: adjust the metric by a pre-period covariate x to shrink variance.
 

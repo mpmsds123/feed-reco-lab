@@ -95,7 +95,7 @@ class LinTS:
 def _make_rounds(env, train_rows, all_items, T, K, seed=7):
     """Each round: a user + K candidate arms (their history + random items)."""
     rng = np.random.default_rng(seed)
-    users = list({u for u, _, _ in train_rows})
+    users = sorted({u for u, _, _ in train_rows})       # sorted: set order changes run to run
     user_hist = {}
     for u, b, _ in train_rows:
         user_hist.setdefault(u, []).append(b)
