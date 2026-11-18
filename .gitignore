@@ -4,3 +4,4 @@ data/synthetic/
 data/yelp/
 .DS_Store
 .ipynb_checkpoints/
+data/real_yelp/

@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 from features import YelpFeatureStore, FEATURE_NAMES           # noqa: E402
 from retrieval import PopularityRetriever, ItemCFRetriever      # noqa: E402
 from ranker import LambdaMARTRanker, _relevance                 # noqa: E402
+from rating_model import HybridRatingModel                      # noqa: E402
 from eval_metrics import (dcg_at_k, recall_at_k,                # noqa: E402
                           average_precision_at_k)
 import bandit as B                                              # noqa: E402
@@ -40,7 +41,6 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir", default="data/synthetic")
     ap.add_argument("--k", type=int, default=10)
-    ap.add_argument("--n_neg_pool", type=int, default=50)
     ap.add_argument("--seed", type=int, default=42)
     a = ap.parse_args()
     rng = np.random.default_rng(a.seed)
@@ -54,101 +54,124 @@ def main():
     all_items = sorted({b for _, b, _ in train})
     item_set = set(all_items)
 
-    # feature store + activity counts from train
-    fs = YelpFeatureStore(a.data_dir)
-    ua, bp = defaultdict(int), defaultdict(int)
-    for u, b, _ in train:
-        ua[u] += 1; bp[b] += 1
-    fs.set_activity(ua, bp)
+    # ---- held-out split of TRAIN for ranker training (val stays untouched as the test set)
+    split_rng = np.random.default_rng(a.seed)
+    fit_rows, label_rows = [], []
+    for row in train:
+        (label_rows if split_rng.random() < 0.2 else fit_rows).append(row)
 
-    user_train_items = defaultdict(set)
-    user_train_mean = {}
-    tmp = defaultdict(list)
-    for u, b, r in train:
-        user_train_items[u].add(b); tmp[u].append(r)
-    for u, rs in tmp.items():
-        user_train_mean[u] = float(np.mean(rs))
+    def build_stage(rows):
+        """Feature store, CF retriever and rating model built from `rows` only."""
+        fs_ = YelpFeatureStore(a.data_dir)
+        ua, bp = defaultdict(int), defaultdict(int)
+        for u, b, _ in rows:
+            ua[u] += 1; bp[b] += 1
+        fs_.set_activity(ua, bp)
+        cf_ = ItemCFRetriever([(u, b, r) for u, b, r in rows if r >= 4])   # CF on LIKES only
+        rm_ = HybridRatingModel(fs_).fit(rows)
+        seen_ = defaultdict(set)
+        for u, b, _ in rows:
+            seen_[u].add(b)
+        return fs_, cf_, rm_, seen_
 
     print("=" * 66)
     print("STAGE 1+2 : RETRIEVAL  ->  LEARNING-TO-RANK")
     print("=" * 66)
+    fs_fit, cf_fit, rm_fit, seen_fit = build_stage(fit_rows)   # for ranker training
+    fs, cf, rm, user_train_items = build_stage(train)          # for serving / evaluation
     pop = PopularityRetriever(train)
-    # CF on LIKES only (rating>=4): co-liking reflects taste, not mere exposure
-    cf = ItemCFRetriever([(u, b, r) for u, b, r in train if r >= 4])
 
-    # Ranker features = CONTENT/quality/user features + the CF retrieval score.
-    # We deliberately EXCLUDE raw volume/exposure counts (popularity, check-in/
-    # photo/tip counts, user-activity): they leak training-exposure bias and hurt
-    # held-out ranking. That is a real finding — see README. The feature store
-    # still holds all 28 features (continuity with the DSCI 553 project).
-    KEEP = {"biz_stars", "usr_average_stars", "star_difference"}
-    keep_idx = [i for i, n in enumerate(FEATURE_NAMES) if n in KEEP]
-    ranker_names = [FEATURE_NAMES[i] for i in keep_idx] + ["cf_score"]
+    # Ranker features. CF score enters as rank and per-user normalised score, not the
+    # raw score: raw co-like counts grow with the amount of data, so their scale
+    # differs between the 80% training models and the 100% serving models.
+    KEEP = ["biz_stars", "usr_average_stars", "star_difference"]
+    keep_idx = [FEATURE_NAMES.index(n) for n in KEEP]
+    ranker_names = KEEP + ["cf_rank", "cf_score_norm", "pred_rating"]
 
-    def feat_fn(u, b):
-        full = fs.build(u, b)
-        return [full[i] for i in keep_idx] + [float(cf.scores_for(u, [b])[0])]
+    def features(fs_, cf_, rm_, u, cand, use_rating=True):
+        sc = cf_.scores_for(u, cand)
+        n = len(cand)
+        cols = [np.asarray([[fs_.build(u, b)[i] for i in keep_idx] for b in cand], float),
+                1 - np.arange(n) / n,                  # candidates arrive in CF order
+                sc / max(sc.max(), 1e-12)]
+        if use_rating:
+            cols.append(rm_.predict(u, cand))
+        return np.column_stack(cols)
 
-    # popularity-matched negatives: sample eval negatives ~ popularity so a plain
-    # popularity ranker gets NO free shortcut — only personalization can win.
-    # The ranker trains on the SAME distribution (item_weights=pop_w).
-    items_arr = np.asarray(all_items)
-    pop_w = np.array([bp[b] for b in all_items], dtype=float)
-    pop_w = pop_w / pop_w.sum()
+    # training groups: candidates from the 80% CF, labelled by the held-out 20%
+    held = defaultdict(dict)
+    for u, b, r in label_rows:
+        held[u][b] = _relevance(r)
+    train_groups = {True: [], False: []}
+    for u, labels in held.items():
+        cand = cf_fit.candidates(u, seen_fit[u], n=100)
+        if not cand or not any(labels.get(b, 0) == 2 for b in cand):
+            continue
+        y = np.asarray([labels.get(b, 0) for b in cand])
+        F = features(fs_fit, cf_fit, rm_fit, u, cand)
+        train_groups[True].append((F, y))
+        train_groups[False].append((F[:, :-1], y))       # ablation: no rating model
+    ltr = LambdaMARTRanker(ranker_names).fit(train_groups[True])
+    ltr_norating = LambdaMARTRanker(ranker_names[:-1]).fit(train_groups[False])
+    print(f"  ranker trained on {len(train_groups[True])} users; "
+          f"max_depth={ltr.depth} picked on a validation slice of training users")
 
-    # hard-negative mining: train the ranker on the retriever's own candidates,
-    # the same distribution it reranks at serve time.
-    ltr = LambdaMARTRanker(feat_fn, ranker_names, n_neg_per_user=60).fit(
-        train, all_items,
-        neg_source_fn=lambda u: cf.candidates(u, user_train_items.get(u, set()), n=120))
-
-    # End-to-end evaluation: each PIPELINE produces its own top-K list, scored
-    # against the user's held-out likes (rating>=4). Popularity retrieves popular
-    # items; CF retrieves personalized items; the two-stage system retrieves 100
-    # with CF then reranks with the LambdaMART model. Recall denominator is the
-    # user's TOTAL held-out likes, so the three are directly comparable.
+    # End-to-end evaluation on val: each PIPELINE produces its own top-K list, scored
+    # against the user's held-out likes (rating>=4). Recall denominator is the user's
+    # TOTAL held-out likes, so all pipelines are directly comparable.
     K = a.k
     val_pos = defaultdict(dict)
     for u, b, r in val:
         if b in item_set:
             val_pos[u][b] = _relevance(r)
 
-    def two_stage(u, seen):
-        cand = cf.candidates(u, seen, n=100)
-        return rank_by(ltr.score(u, cand), cand) if cand else []
+    def two_stage(model, use_rating):
+        def run(u, seen):
+            cand = cf.candidates(u, seen, n=100)
+            if not cand:
+                return []
+            return rank_by(model.score(features(fs, cf, rm, u, cand, use_rating)), cand)
+        return run
 
     pipelines = {
         "Popularity (baseline)": lambda u, seen: pop.candidates(u, seen, K),
         "Item-CF retrieval":     lambda u, seen: cf.candidates(u, seen, K),
-        "Two-stage CF->LTR":     two_stage,
+        "Two-stage, no rating model": two_stage(ltr_norating, False),
+        "Two-stage CF->LTR":     two_stage(ltr, True),
     }
     rels_by_pipe = {name: {} for name in pipelines}
     for u, rel_items in val_pos.items():
         if u not in user_train_items:
             continue
-        grades = [g for g in rel_items.values() if g > 0]
-        if not grades:
+        if not any(g > 0 for g in rel_items.values()):
             continue
         seen = user_train_items[u]
-        idcg = dcg_at_k(sorted(rel_items.values(), reverse=True), K)
         for name, fn in pipelines.items():
-            rels = [rel_items.get(b, 0) for b in fn(u, seen)[:K]]
-            rels_by_pipe[name][u] = rels
+            rels_by_pipe[name][u] = [rel_items.get(b, 0) for b in fn(u, seen)[:K]]
 
+    ndcg_by_pipe = {}
     for name in pipelines:
         rr = rels_by_pipe[name]
-        ndcg, rec, mapk, nu = [], [], [], 0
+        ndcg, rec, mapk = [], [], []
         for u, rels in rr.items():
             grades = [g for g in val_pos[u].values() if g > 0]
             idcg = dcg_at_k(sorted(val_pos[u].values(), reverse=True), K)
             ndcg.append(dcg_at_k(rels, K) / idcg if idcg else 0.0)
             rec.append(sum(1 for r in rels if r > 0) / len(grades))
             mapk.append(average_precision_at_k(rels, K))
-            nu += 1
-        print(f"  {name:24s}  NDCG@{K}={np.mean(ndcg):.4f}  "
-              f"Recall@{K}={np.mean(rec):.4f}  MAP@{K}={np.mean(mapk):.4f}  (n={nu})")
+        ndcg_by_pipe[name] = np.asarray(ndcg)
+        print(f"  {name:28s}  NDCG@{K}={np.mean(ndcg):.4f}  "
+              f"Recall@{K}={np.mean(rec):.4f}  MAP@{K}={np.mean(mapk):.4f}  (n={len(rr)})")
     rels_pop = rels_by_pipe["Popularity (baseline)"]
     rels_cf = rels_by_pipe["Item-CF retrieval"]
+
+    print(f"\n  Paired t-test on per-user NDCG@{K}, same users (each stage vs the one before):")
+    for prev, nxt in [("Popularity (baseline)", "Item-CF retrieval"),
+                      ("Item-CF retrieval", "Two-stage, no rating model"),
+                      ("Item-CF retrieval", "Two-stage CF->LTR")]:
+        pt = X.paired_ttest(ndcg_by_pipe[prev], ndcg_by_pipe[nxt])
+        print(f"     {nxt:28s} vs {prev:22s}  diff={pt['mean_diff']:+.4f}  "
+              f"95% CI [{pt['ci95'][0]:+.4f}, {pt['ci95'][1]:+.4f}]  p={pt['p_value']:.1e}")
 
     print("\n  Top LTR features by gain:")
     for name, g in ltr.feature_importance()[:6]:
